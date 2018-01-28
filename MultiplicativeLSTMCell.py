@@ -53,15 +53,12 @@ class MultiplicativeLSTMCell(RNNCell):
 
     """
 
-    def __init__(self, num_units,
-                 use_peepholes=False,
+    def __init__(self,
+                 num_units,
                  cell_clip=None,
                  initializer=orthogonal_initializer(),
-                 num_proj=None,
-                 proj_clip=None,
                  forget_bias=1.0,
-                 state_is_tuple=True,
-                 activation=tf.tanh):
+                 state_is_tuple=True):
         """Initialize the parameters for an LSTM cell.
         Args:
           num_units: int, The number of units in the LSTM cell.
@@ -78,26 +75,17 @@ class MultiplicativeLSTMCell(RNNCell):
             the training.
           activation: Activation function of the inner states.
         """
+
         self.num_units = num_units
-        self.use_peepholes = use_peepholes
         self.cell_clip = cell_clip
-        self.num_proj = num_proj
-        self.proj_clip = proj_clip
         self.initializer = initializer
         self.forget_bias = forget_bias
         self.state_is_tuple = state_is_tuple
-        self.activation = activation
 
-        if num_proj:
-            self._state_size = (
-                tf.nn.rnn_cell.LSTMStateTuple(num_units, num_proj)
-                if state_is_tuple else num_units + num_proj)
-            self._output_size = num_proj
-        else:
-            self._state_size = (
-                tf.nn.rnn_cell.LSTMStateTuple(num_units, num_units)
-                if state_is_tuple else 2 * num_units)
-            self._output_size = num_units
+        self._state_size = (
+                tf.nn.rnn_cell.LSTMStateTuple(num_units, num_units) if state_is_tuple else 2 * num_units
+        )
+        self._output_size = num_units
 
     @property
     def state_size(self):
@@ -109,7 +97,7 @@ class MultiplicativeLSTMCell(RNNCell):
 
     def __call__(self, inputs, state, scope=None):
 
-        num_proj = self.num_units if self.num_proj is None else self.num_proj
+        num_proj = self.num_units
 
         if self.state_is_tuple:
             (c_prev, h_prev) = state
@@ -127,51 +115,27 @@ class MultiplicativeLSTMCell(RNNCell):
 
             with tf.variable_scope("Multipli_Weight"):
                 concat = _linear([inputs, h_prev], 2 * self.num_units, True)
-            Wx, Wh = tf.split(concat, 2, 1)
-            m = Wx * Wh  # equation (18)
+            Wmx_xt, Wmh_hprev = tf.split(concat, 2, 1)
+            mt = Wmx_xt * Wmh_hprev  # equation (18)
 
             with tf.variable_scope("LSTM_Weight"):
-                lstm_matrix = _linear([inputs, m], 4 * self.num_units, True)
-            i, j, f, o = tf.split(lstm_matrix, 4, 1)
+                lstm_matrix = _linear([inputs, mt], 4 * self.num_units, True)
+            it_arg, ht_hat, ft_arg, ot_arg = tf.split(lstm_matrix, 4, 1)
 
-            # Diagonal connections
-            if self.use_peepholes:
-                w_f_diag = tf.get_variable(
-                    "W_F_diag", shape=[self.num_units], dtype=dtype)
-                w_i_diag = tf.get_variable(
-                    "W_I_diag", shape=[self.num_units], dtype=dtype)
-                w_o_diag = tf.get_variable(
-                    "W_O_diag", shape=[self.num_units], dtype=dtype)
+            it = tf.sigmoid(it_arg)
+            ft = tf.sigmoid(ft_arg + self.forget_bias)
+            ot = tf.sigmoid(ot_arg)
 
-            if self.use_peepholes:
-                c = c_prev * tf.sigmoid(f + self.forget_bias +
-                                        w_f_diag * c_prev) + \
-                    tf.sigmoid(i + w_i_diag * c_prev) * j
-            else:
-                c = c_prev * tf.sigmoid(f + self.forget_bias) + \
-                    tf.sigmoid(i) * j
+            ct = c_prev * ft + it * tf.nn.tanh(ht_hat)
 
             if self.cell_clip is not None:
-                c = tf.clip_by_value(c, -self.cell_clip, self.cell_clip)
+                ct = tf.clip_by_value(ct, -self.cell_clip, self.cell_clip)
 
-            if self.use_peepholes:
-                h = tf.sigmoid(o + w_o_diag * c) * \
-                    self.activation(c * (o + w_o_diag * c))
-            else:
-                h = self.activation(c * o)
+            ht = tf.nn.tanh(ct) * ot
 
-            if self.num_proj is not None:
-                w_proj = tf.get_variable(
-                    "W_P", [self.num_units, num_proj], dtype=dtype)
+            new_state = (tf.nn.rnn_cell.LSTMStateTuple(ct, ht) if self.state_is_tuple else tf.concat([ct, ht],1))
 
-                h = tf.matmul(h, w_proj)
-                if self.proj_clip is not None:
-                    h = tf.clip_by_value(h, -self.proj_clip, self.proj_clip)
-
-            new_state = (tf.nn.rnn_cell.LSTMStateTuple(c, h)
-                         if self.state_is_tuple else tf.concat([c, h],1))
-
-            return h, new_state
+            return ht, new_state
 
 
 def _linear(args, output_size, bias, bias_start=0.0, scope=None):
